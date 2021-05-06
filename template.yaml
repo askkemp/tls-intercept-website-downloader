@@ -1,0 +1,522 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: "Deployment of Website Downloader code found at https://github.com/askkemp/tls-intercept-website-downloader"
+
+Parameters:
+  sqsQueueBaseName:
+    Type: String
+    Default: website_downloader_jobs
+    Description: "Base name of SQS Queue which contains job requests"
+  s3BucketBaseName:
+    Type: String
+    Default: website-downloader-output-files
+    Description: "Name of S3 bucket to store job results"
+  CloudWatchLogGroupBaseName:
+    Type: String
+    Default: website-downloader-logs
+    Description: "Location to store logs from EC2 instances"
+  AutoScalingAutoScalingGroupName:
+    Type: String
+    Default: website-downloader-Autoscale
+    Description: "Name of autoscaling group"
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  lambda:
+    Type: AWS::Serverless::Function # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html
+    Properties:
+      FunctionName: !Sub "WebsiteDownloader-lambda-${AWS::Region}"
+      Description: "Deployment of Website Downloader code found at https://github.com/askkemp/tls-intercept-website-downloader"
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:ListBucket
+          Resource: 
+            - !Sub 'arn:aws:s3:::${S3BucketForDownload}'
+            - "arn:aws:s3:::*/*"
+        - Effect: Allow
+          Action:
+          - s3:ListBucket
+          Resource: 
+            - "arn:aws:s3:::*/*"
+      - Statement:
+        - Effect: Allow
+          Action:
+          - sqs:SendMessage
+          - sqs:GetQueueAttributes
+          - sqs:GetQueueUrl
+          Resource: !GetAtt SQSQueue.Arn
+      - Statement:
+        - Effect: Allow
+          Action:
+          - autoscaling:ExecutePolicy
+          - autoscaling:DescribeAutoScalingGroups
+          Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AutoScalingAutoScalingGroup}"
+      - Statement:
+        - Effect: Allow
+          Action:
+          - autoscaling:DescribeAutoScalingGroups
+          Resource: "*"
+      CodeUri: lambda/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      Environment:
+        Variables:
+          ENV_S3_BUCKET_NAME: !Ref S3BucketForDownload
+          ENV_S3_LINK_EXPIRATION: 7200
+          ENV_ADD_CAPACITY_POLICY_ARN: !Ref AddCapacity
+          ENV_AUTOSCALEGROUP_NAME: !Ref AutoScalingAutoScalingGroup
+          ENV_SQS_URL: !Ref SQSQueue
+      Events: # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html#sam-function-events
+        DownloaderAPI:
+          Type: Api # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-property-function-api.html
+          Properties:
+            RestApiId: !Ref ServerlessApi
+            Path: /websitedownloader
+            Method: post
+            Auth:
+              ApiKeyRequired: true
+
+  ServerlessApi:
+    Type: AWS::Serverless::Api # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-api.html
+    DependsOn:
+     - lambda
+    Properties:
+      Name: !Sub "Website-Downloader-${AWS::Region}"
+      Description: "Website Downloader plan created automatically by Cloudformation"
+      StageName: Prod
+      Auth: # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-property-api-apiauth.html
+        ApiKeyRequired: true # sets for all methods
+        UsagePlan: # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-property-api-apiusageplan.html
+          CreateUsagePlan: NONE # allows Apikey, UsagePlan, UsagePlanKey to be manually defined
+          UsagePlanName: "Website Downloader API Plan"
+          Quota:
+            Limit: 100
+            Period: DAY
+#          Throttle:
+#            BurstLimit: 50
+#            RateLimit: 100
+
+  ApiKey: 
+    Type: AWS::ApiGateway::ApiKey # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-apikey.html
+    DependsOn: 
+      - ServerlessApi
+    Properties: 
+      Name: "WebsiteDownloaderAPIKey"
+      Description: "Key to be used inside Website Downloader client-side Python script"
+      Enabled: true
+      StageKeys: # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-apigateway-apikey-stagekey.html
+        - RestApiId: !Ref ServerlessApi
+          StageName: !Ref ServerlessApi.Stage
+
+  ApiUsagePlan:
+    Type: "AWS::ApiGateway::UsagePlan"
+    DependsOn:
+      - ServerlessApi
+    Properties:
+      ApiStages: 
+        - ApiId: !Ref ServerlessApi
+          Stage: !Ref ServerlessApi.Stage
+      Description: "Website Downloader plan created automatically by Cloudformation"
+      Quota:
+        Limit: 1000
+        Period: MONTH
+      UsagePlanName: "Website Downloader API Plan"
+
+  ApiUsagePlanKey:
+    Type: "AWS::ApiGateway::UsagePlanKey"
+    DependsOn: 
+      - ServerlessApi
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  SQSQueue:
+    Type: "AWS::SQS::Queue"
+    Properties:
+      DelaySeconds: "0"
+      MaximumMessageSize: "262144"
+      MessageRetentionPeriod: "7200"
+      ReceiveMessageWaitTimeSeconds: "0"
+      VisibilityTimeout: "10800"
+      QueueName: !Sub "${sqsQueueBaseName}-${AWS::Region}"
+
+  EC2IAMRole:
+    Type: "AWS::IAM::Role" # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-role.html
+    Properties:
+      Path: "/"
+      RoleName: !Sub "WebsiteDownloader-EC2Role-${AWS::Region}" # Unique IAM role for each region
+      AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      MaxSessionDuration: 7200 # two hours
+      Description: "Used by EC2 instance to read the SQS queue, write to Cloudwatch, self terminate EC2 instances, write to S3 bucket."
+
+      Policies:
+        -
+          PolicyDocument: !Sub |
+              {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Sid": "VisualEditor0",
+                          "Effect": "Allow",
+                          "Action": [
+                              "sqs:DeleteMessage",
+                              "sqs:ReceiveMessage",
+                              "sqs:GetQueueAttributes",
+                              "sqs:GetQueueUrl"
+                          ],
+                          "Resource": "${SQSQueue.Arn}"
+                      }
+                  ]
+              }
+          PolicyName: "SQS-Receive-delete"
+        -
+          PolicyDocument: !Sub |
+              {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Sid": "VisualEditor0",
+                          "Effect": "Allow",
+                          "Action": [
+                              "logs:CreateLogStream",
+                              "logs:PutLogEvents"
+                          ],
+                          "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CWLogGroup}:log-stream:*"
+                      }
+                  ]
+              }
+          PolicyName: "Cloudwatch-Create-Put"
+        -
+          PolicyDocument: !Sub |
+              {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Sid": "VisualEditor0",
+                          "Effect": "Allow",
+                          "Action": "autoscaling:TerminateInstanceInAutoScalingGroup",
+                          "Resource": "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AutoScalingAutoScalingGroupName}"
+                      }
+                  ]
+              }
+          PolicyName: "EC2-terminate-autoscale-instance"
+        -
+          PolicyDocument: !Sub |
+              {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Sid": "VisualEditor0",
+                          "Effect": "Allow",
+                          "Action": "s3:PutObject",
+                          "Resource": "arn:aws:s3:::${S3BucketForDownload}/*"
+                      }
+                  ]
+              }
+          PolicyName: "S3-write"
+
+  EC2InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      InstanceProfileName: !Sub "WebsiteDownloader-${AWS::Region}" # Must be unique per region
+      Path: "/"
+      Roles:  # role to associate with the instance profile
+        - !Ref EC2IAMRole
+
+  EC2LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateName: "website-downloader-ec2-template"
+      LaunchTemplateData: # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-launchtemplatedata.html
+        BlockDeviceMappings:
+          - DeviceName: '/dev/xvda'
+            Ebs: # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html
+              VolumeSize: 30 # GB
+              VolumeType: gp2
+              DeleteOnTermination: true
+        TagSpecifications: 
+          - 
+            ResourceType: "instance"
+            Tags: 
+              - 
+                Key: "Name"
+                Value: "WebsiteDownloader"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo 'ENV_S3_BUCKET_NAME=${S3BucketForDownload}' > /etc/sysconfig/wdenv.conf
+            echo 'ENV_SQS_URL=${SQSQueue}' >> /etc/sysconfig/wdenv.conf
+            echo 'ENV_CLOUDWATCH_LOG_GROUP=${CWLogGroup}' >> /etc/sysconfig/wdenv.conf
+            yum install git -y
+            git clone https://github.com/askkemp/tls-intercept-website-downloader.git /home/ec2-user/tls-intercept-website-downloader/
+            bash /home/ec2-user/tls-intercept-website-downloader/server_install.sh
+        InstanceInitiatedShutdownBehavior: "terminate"
+        IamInstanceProfile: # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-launchtemplatedata-iaminstanceprofile.html
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        EbsOptimized: false
+        DisableApiTermination: false
+        NetworkInterfaces: 
+          - 
+             AssociatePublicIpAddress: true
+             DeleteOnTermination: true
+             DeviceIndex: 0
+             Ipv6AddressCount: 1
+             SubnetId: !Ref EC2SubnetA
+        ImageId: !Ref LatestAmiId
+        InstanceType: "t2.micro"
+        Monitoring: 
+            Enabled: false
+
+  S3BucketForDownload:
+      Type: "AWS::S3::Bucket"
+      Properties:
+        BucketName: !Sub "${s3BucketBaseName}-${AWS::Region}-${AWS::AccountId}"
+        LifecycleConfiguration: 
+          Rules: 
+            - 
+               Id: "Expire_1_day"
+               Status: "Enabled"
+               ExpirationInDays: 1
+
+  EC2VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: "192.168.0.0/22"
+      EnableDnsSupport: true
+      EnableDnsHostnames: false
+      InstanceTenancy: "default"
+      Tags:
+        - Key: "Name"
+          Value: "WebsiteDownloader"
+
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        - Key: "Name"
+          Value: "WebsiteDownloader"
+
+  EC2VPCGatewayAttachment:
+      Type: "AWS::EC2::VPCGatewayAttachment"
+      Properties:
+        InternetGatewayId: !Ref InternetGateway
+        VpcId: !Ref EC2VPC
+
+  EC2SubnetA:
+    Type: "AWS::EC2::Subnet"
+    DependsOn: VpcCidrBlockIPv6
+    Properties:
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: "192.168.0.0/24"
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt 'EC2VPC.Ipv6CidrBlocks'], 256, 64]]
+      VpcId: !Ref EC2VPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: "WebsiteDownloader"
+
+  VpcCidrBlockIPv6:
+    Type: "AWS::EC2::VPCCidrBlock"
+    Properties: 
+      AmazonProvidedIpv6CidrBlock: true
+      VpcId: !Ref EC2VPC
+
+  RouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref EC2VPC 
+      Tags:
+        - Key: "Name"
+          Value: "WebsiteDownloader"
+
+  DefaultRouteIPv4:
+    Type: "AWS::EC2::Route"
+    Properties:
+        DestinationCidrBlock: "0.0.0.0/0"
+        GatewayId: !Ref InternetGateway
+        RouteTableId: !Ref RouteTable
+
+  DefaultRouteIPv6:
+    Type: "AWS::EC2::Route"
+    Properties:
+        DestinationIpv6CidrBlock: "::/0"
+        GatewayId: !Ref InternetGateway
+        RouteTableId: !Ref RouteTable
+
+  PublicSubnet1RouteTableAssociation:
+   Type: "AWS::EC2::SubnetRouteTableAssociation"
+   Properties:
+     RouteTableId: !Ref RouteTable
+     SubnetId: !Ref EC2SubnetA
+
+  AutoScalingAutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup" # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-as-group.html
+    Properties:
+      AutoScalingGroupName: !Sub "${AutoScalingAutoScalingGroupName}"
+      MixedInstancesPolicy: 
+          LaunchTemplate: 
+              LaunchTemplateSpecification: 
+                  LaunchTemplateId: !Ref EC2LaunchTemplate
+                  Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      MinSize: 0
+      MaxSize: 2
+      DesiredCapacity: 0
+      Cooldown: 300
+      AvailabilityZones: 
+        - !GetAtt EC2SubnetA.AvailabilityZone
+      HealthCheckType: "EC2"
+      HealthCheckGracePeriod: 120
+      TerminationPolicies: 
+        - "Default"
+      ServiceLinkedRoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+      MetricsCollection: 
+        - Granularity: "1Minute"
+          Metrics: 
+            - "GroupMaxSize"
+            - "GroupInServiceInstances"
+            - "GroupInServiceCapacity"
+            - "GroupPendingInstances"
+            - "GroupDesiredCapacity"
+            - "GroupTerminatingCapacity"
+            - "GroupPendingCapacity"
+            - "GroupTerminatingInstances"
+            - "GroupStandbyInstances"
+            - "GroupTotalInstances"
+            - "GroupMinSize"
+            - "GroupTotalCapacity"
+            - "GroupStandbyCapacity"
+      NewInstancesProtectedFromScaleIn: false
+      CapacityRebalance: true
+
+  # Policy name is not changable and will become ${name of app}-${name of resource}-lettersnumbers
+  # Lambda function calls this policy by name
+  AddCapacity:
+    Type: "AWS::AutoScaling::ScalingPolicy"
+    Properties:
+        AutoScalingGroupName: !Ref AutoScalingAutoScalingGroup
+        PolicyType: "SimpleScaling"
+        AdjustmentType: "ChangeInCapacity"
+        ScalingAdjustment: 1
+        Cooldown: 300
+
+  RemoveAllCapacity:
+    Type: "AWS::AutoScaling::ScalingPolicy"
+    Properties:
+        AutoScalingGroupName: !Ref AutoScalingAutoScalingGroup
+        PolicyType: "SimpleScaling"
+        AdjustmentType: "ExactCapacity"
+        ScalingAdjustment: 0
+        Cooldown: 300
+
+  CWLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub "${CloudWatchLogGroupBaseName}-${AWS::Region}"
+      RetentionInDays: 30
+
+  CWAlarmSQSQueueEntry:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+        AlarmName: "WebsiteDownloader - Entry in SQS queue"
+        AlarmDescription: "Will add EC2 capacity with autoscale policy."
+        ActionsEnabled: true
+        AlarmActions: 
+          - !Ref AddCapacity
+        MetricName: "ApproximateNumberOfMessagesVisible"
+        Namespace: "AWS/SQS"
+        Statistic: "Average"
+        Dimensions: 
+          - 
+            Name: "QueueName"
+            Value: !GetAtt SQSQueue.QueueName
+        Period: 86400 # 1 day dummy value
+        EvaluationPeriods: 1
+        DatapointsToAlarm: 1
+        Threshold: 1
+        ComparisonOperator: "GreaterThanOrEqualToThreshold"
+
+  CWAlarmSQSQueueEmpty:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+        AlarmName: "WebsiteDownloader - Running EC2 instances but no jobs"
+        AlarmDescription: "Will remove all EC2 capacity with autoscale policy."
+        ActionsEnabled: true
+        AlarmActions: 
+          - !Ref RemoveAllCapacity
+        EvaluationPeriods: 1
+        DatapointsToAlarm: 1
+        Threshold: 1
+        ComparisonOperator: "GreaterThanOrEqualToThreshold"
+        Metrics: 
+          - 
+            Id: "e1"
+            Expression: "(m1 == 0 AND m2 == 0 AND m3 > 0)"
+            Label: "SQS Queues empty yet EC2 instances present"
+            ReturnData: true
+          - 
+            Id: "m1"
+            MetricStat: 
+                Metric: 
+                    Namespace: "AWS/SQS"
+                    MetricName: "ApproximateNumberOfMessagesNotVisible"
+                    Dimensions: 
+                      - 
+                        Name: "QueueName"
+                        Value: !GetAtt SQSQueue.QueueName
+                Period: 300
+                Stat: "Sum"
+            ReturnData: false
+          - 
+            Id: "m2"
+            MetricStat: 
+                Metric: 
+                    Namespace: "AWS/SQS"
+                    MetricName: "ApproximateNumberOfMessagesVisible"
+                    Dimensions: 
+                      - 
+                        Name: "QueueName"
+                        Value: !GetAtt SQSQueue.QueueName
+                Period: 300
+                Stat: "Sum"
+            ReturnData: false
+          - 
+            Id: "m3"
+            MetricStat: 
+                Metric: 
+                    Namespace: "AWS/AutoScaling"
+                    MetricName: "GroupTotalInstances"
+                    Dimensions: 
+                      - 
+                        Name: "AutoScalingGroupName"
+                        Value: !Ref AutoScalingAutoScalingGroup
+                Period: 300
+                Stat: "Sum"
+            ReturnData: false
+
+
+Outputs:
+  APIURL:
+    Description: "Place this URL into client.py"
+    Value: !Sub "https://${ServerlessApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/websitedownloader/"
+#  WebsiteDownloaderLambdaFunction:
+#    Description: "The ARN for the website downloader Lambda function"
+#    Value: !GetAtt lambda.Arn
+#  S3Bucket:
+#    Description: "A private S3 bucket where job results are stored as tar.gz files"
+#    Value: !GetAtt S3BucketForDownload.WebsiteURL
+#  SQSQueue:
+#    Description: "The SQS queue that contains requested website download jobs"
+#    Value: !GetAtt SQSQueue.QueueName
+#  AutoScalingGroup:
+#    Description: "The autoscaling group that spawns EC2 instances to process website download jobs"
+#    Value: !Ref AutoScalingAutoScalingGroup
