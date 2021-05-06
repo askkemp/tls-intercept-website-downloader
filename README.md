@@ -208,7 +208,6 @@ $ tree 7562fa93-0a49-448c-89c6-8cc489bb54fd-eu-central-1
 21 directories, 18 files
 ```
 
-
 # FAQ
 **Where does the API key and url come from?**
 
