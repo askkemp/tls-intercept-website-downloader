@@ -581,7 +581,7 @@ Examples:\n\
                 for region, data in item.items():
                     display_useragent_options(apikey=data['key'], apiurl=data['url'], apiregion=region)
         else:
-            display_useragent_options(apikey=api_info[1], apiurl=api_info[2])
+            display_useragent_options(apikey=api_info[1], apiurl=api_info[2], apiregion=api_info[3])
 
     # Get Status
     if args.in_status and args.in_awsregion:
